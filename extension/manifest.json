@@ -5,7 +5,6 @@
   "description": "A generic, developer-friendly bridge for AI agents to control Chrome securely in the background.",
   "permissions": [
     "tabs",
-    "activeTab",
     "scripting",
     "webNavigation",
     "storage"

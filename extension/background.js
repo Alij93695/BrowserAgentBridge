@@ -306,13 +306,29 @@ function isWebUrl(url) {
 }
 
 function isScriptableUrl(url) {
-  // Returns true only for pages where chrome.scripting.executeScript is allowed
   if (!url) return false;
-  const blocked = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'devtools://', 'view-source:'];
-  for (const prefix of blocked) {
-    if (url.startsWith(prefix)) return false;
+  try {
+    const parsed = new URL(url);
+    // Only http, https, and file schemes are allowed
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'file:') {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    // Block Chrome Web Store, Edge Add-ons, and local browser pages
+    if (host === 'chromewebstore.google.com' || 
+        (host === 'chrome.google.com' && parsed.pathname.startsWith('/webstore')) ||
+        (host === 'edge.microsoft.com' && parsed.pathname.startsWith('/addons'))) {
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // If URL parsing fails, check startsWith prefixes as fallback
+    const blocked = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'devtools://', 'view-source:'];
+    for (const prefix of blocked) {
+      if (url.startsWith(prefix)) return false;
+    }
+    return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
   }
-  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
 }
 
 async function getActiveTab() {
@@ -417,8 +433,8 @@ async function runInTab(func, args = [], tabId = null) {
 
     return results[0].result;
   } catch (err) {
-    // Provide a clearer message for the common "activeTab not in effect" error
-    if (err.message && err.message.includes('activeTab')) {
+    const errMsg = err.message || '';
+    if (errMsg.includes('activeTab') || errMsg.includes('Cannot access') || errMsg.includes('permission') || errMsg.includes('not allowed')) {
       throw new Error(
         `Permission denied for tab ${tab.id} (${tab.url}). ` +
         `Make sure the extension has "All sites" access: right-click the extension icon → "This can read and change site data" → "On all sites".`
