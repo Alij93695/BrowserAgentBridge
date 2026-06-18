@@ -171,6 +171,8 @@ async def post_command(cmd: CommandRequest):
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 telemetry_task = None
+_last_screenshot_time = 0
+SCREENSHOT_COOLDOWN = 1.5  # Minimum seconds between screenshot requests to the extension
 
 def schedule_telemetry_refresh():
     global telemetry_task
@@ -179,12 +181,13 @@ def schedule_telemetry_refresh():
     telemetry_task = asyncio.create_task(refresh_dashboard_telemetry())
 
 async def refresh_dashboard_telemetry():
-    # Wait a moment to allow page changes to settle and coalesce events
+    global _last_screenshot_time
+    # Debounce: wait 2s to coalesce multiple rapid triggers into one refresh
     try:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
     except asyncio.CancelledError:
         return
-        
+
     if not extension_manager.is_connected():
         return
     try:
@@ -195,9 +198,16 @@ async def refresh_dashboard_telemetry():
     except Exception as e:
         logger.warning(f"Failed to update tab list telemetry: {str(e)}")
 
+    # Rate-limit screenshots on the server side too (defense-in-depth)
+    import time
+    now = time.monotonic()
+    if (now - _last_screenshot_time) < SCREENSHOT_COOLDOWN:
+        logger.debug("Skipping screenshot — cooldown active")
+        return
+
     try:
-        # Capture screenshot (optional/silent fallback if tab is in background or minimized)
-        screenshot = await extension_manager.send_command("screenshot", timeout=3.0)
+        screenshot = await extension_manager.send_command("screenshot", timeout=5.0)
+        _last_screenshot_time = time.monotonic()
         if screenshot and not screenshot.startswith("data:image/png;base64,iVBORw0G"):
             extension_manager.last_screenshot = screenshot
             await broadcast_to_dashboards({"type": "screenshot", "screenshot": screenshot})

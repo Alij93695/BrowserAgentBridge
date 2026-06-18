@@ -3,15 +3,83 @@ const WS_URL = 'ws://localhost:1313/ws';
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
+const MAX_RECONNECT_DELAY = 60000; // Cap at 60s to avoid flooding console
 let targetTabId = null;
 
+// --- Screenshot Rate Limiter ---
+// Chrome enforces MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND (~2/sec).
+// We debounce and queue screenshot requests to stay well within the limit.
+let lastScreenshotTime = 0;
+const SCREENSHOT_MIN_INTERVAL_MS = 1000; // At most 1 screenshot per second
+let pendingScreenshotResolvers = [];
+let screenshotInFlight = false;
+
+async function throttledScreenshot() {
+  const now = Date.now();
+  const elapsed = now - lastScreenshotTime;
+
+  if (screenshotInFlight) {
+    // Already capturing — queue this request and resolve it with the same result
+    return new Promise((resolve) => {
+      pendingScreenshotResolvers.push(resolve);
+    });
+  }
+
+  if (elapsed < SCREENSHOT_MIN_INTERVAL_MS) {
+    // Too soon — wait then capture
+    const waitMs = SCREENSHOT_MIN_INTERVAL_MS - elapsed;
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+
+  screenshotInFlight = true;
+  try {
+    const result = await _captureScreenshot();
+    // Resolve any queued callers with the same result
+    for (const resolver of pendingScreenshotResolvers) {
+      resolver(result);
+    }
+    pendingScreenshotResolvers = [];
+    return result;
+  } finally {
+    lastScreenshotTime = Date.now();
+    screenshotInFlight = false;
+  }
+}
+
+async function _captureScreenshot() {
+  try {
+    const tab = await getTargetTab();
+    if (!tab) throw new Error('No target tab found');
+
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 75 });
+    return dataUrl;
+  } catch (err) {
+    // Graceful fallback — return 1x1 transparent PNG so callers don't crash
+    console.warn('Screenshot capture failed (expected for background/internal tabs):', err.message);
+    return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  }
+}
+
+// --- WebSocket Connection (with smart backoff & silent reconnect) ---
+
 function connect() {
-  console.log('Connecting to BrowserAgentBridge Daemon...');
-  ws = new WebSocket(WS_URL);
+  // Clean up any existing connection
+  if (ws) {
+    try { ws.close(); } catch (e) { /* ignore */ }
+    ws = null;
+  }
+
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch (err) {
+    // WebSocket constructor failed (very rare). Schedule silent retry.
+    scheduleReconnect();
+    return;
+  }
 
   ws.onopen = () => {
-    console.log('Connected to Daemon!');
-    reconnectDelay = 1000; // Reset reconnect delay
+    console.log('BrowserAgentBridge: Connected to Daemon');
+    reconnectDelay = 1000; // Reset backoff on successful connect
     chrome.storage.local.set({ connected: true });
     sendToDaemon({ type: 'status', status: 'connected' });
     startHeartbeat();
@@ -20,7 +88,6 @@ function connect() {
   ws.onmessage = async (event) => {
     try {
       const message = JSON.parse(event.data);
-      console.log('Received command:', message);
       const { id, action, params } = message;
 
       if (!action) return;
@@ -33,19 +100,19 @@ function connect() {
         sendToDaemon({ id, success: false, error: err.message });
       }
     } catch (err) {
-      console.error('Error parsing message:', err);
+      console.error('Error parsing daemon message:', err);
     }
   };
 
   ws.onclose = () => {
-    console.log('Connection closed. Retrying in ' + reconnectDelay + 'ms...');
     chrome.storage.local.set({ connected: false });
     stopHeartbeat();
     scheduleReconnect();
   };
 
-  ws.onerror = (err) => {
-    console.error('WebSocket error:', err);
+  ws.onerror = () => {
+    // Suppress noisy "WebSocket error: [object Event]" — the onclose handler
+    // already manages reconnection. Only log at debug level.
     chrome.storage.local.set({ connected: false });
     stopHeartbeat();
   };
@@ -74,7 +141,8 @@ function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
     connect();
-    reconnectDelay = Math.min(reconnectDelay * 2, 30000); // Exponential backoff up to 30s
+    // Exponential backoff: 1s → 2s → 4s → 8s → ... → 60s max
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
   }, reconnectDelay);
 }
 
@@ -87,7 +155,8 @@ function sendToDaemon(data) {
 // Start connection
 connect();
 
-// Command handler router
+// --- Command Handler Router ---
+
 async function handleCommand(action, params = {}) {
   const tabId = params.tab_id || params.tabId || null;
   switch (action) {
@@ -100,10 +169,10 @@ async function handleCommand(action, params = {}) {
     case 'close_tab':
       return await closeTab(params.tab_id);
     case 'screenshot':
-      return await captureScreenshot();
+      return await throttledScreenshot(); // Rate-limited!
     case 'navigate':
       return await navigate(params.url, tabId);
-    
+
     // Page-level actions that run scripts inside the tab
     case 'get_content':
       return await runInTab(getContentInTab, [], tabId);
@@ -119,7 +188,7 @@ async function handleCommand(action, params = {}) {
       return await runInTab(executeRawJs, [params.code], tabId);
     case 'gmail_search':
       return await runInTab(gmailSearchInTab, [params.query], tabId);
-    
+
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -140,15 +209,14 @@ async function listTabs() {
 
 async function newTab(url = 'https://www.google.com', active = true) {
   const tab = await chrome.tabs.create({ url, active });
-  targetTabId = tab.id; // Store new tab
+  targetTabId = tab.id;
   return { id: tab.id, title: tab.title, url: tab.url };
 }
 
 async function selectTab(tabId) {
   const parsedId = parseInt(tabId);
   const tab = await chrome.tabs.update(parsedId, { active: true });
-  targetTabId = parsedId; // Store selected tab
-  // Also focus the window containing the tab
+  targetTabId = parsedId;
   if (tab.windowId) {
     await chrome.windows.update(tab.windowId, { focused: true });
   }
@@ -165,18 +233,8 @@ async function closeTab(tabId) {
 }
 
 async function captureScreenshot() {
-  try {
-    const tab = await getTargetTab();
-    if (!tab) throw new Error('No target tab found');
-    
-    // Capture active window visible area
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 75 });
-    return dataUrl;
-  } catch (err) {
-    console.warn('Failed to capture screenshot:', err.message);
-    // Return a transparent 1x1 PNG fallback so telemetry loop doesn't error out
-    return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-  }
+  // Public API entry — delegates to throttled version
+  return await throttledScreenshot();
 }
 
 async function navigate(url, tabId = null) {
@@ -195,26 +253,25 @@ async function navigate(url, tabId = null) {
     tab = await getTargetTab();
   }
   if (!tab) throw new Error('No target tab found');
-  
+
   // Ensure protocol is present
   if (!/^https?:\/\//i.test(url)) {
     url = 'https://' + url;
   }
-  
+
   // Detect hash-only navigation to avoid waiting for page reload status 'complete'
   const currentUrl = tab.url;
   const currentBase = currentUrl ? currentUrl.split('#')[0] : '';
   const newBase = url.split('#')[0];
-  
+
   if (currentBase === newBase && currentUrl !== url) {
     await chrome.tabs.update(tab.id, { url });
     return { id: tab.id, url, status: 'hashchange' };
   }
-  
+
   return new Promise((resolve, reject) => {
     let completed = false;
-    
-    // Set a safety timeout
+
     const timeout = setTimeout(() => {
       if (!completed) {
         completed = true;
@@ -248,6 +305,16 @@ function isWebUrl(url) {
   return url && (url.startsWith('http://') || url.startsWith('https://'));
 }
 
+function isScriptableUrl(url) {
+  // Returns true only for pages where chrome.scripting.executeScript is allowed
+  if (!url) return false;
+  const blocked = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'devtools://', 'view-source:'];
+  for (const prefix of blocked) {
+    if (url.startsWith(prefix)) return false;
+  }
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+}
+
 async function getActiveTab() {
   let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (tabs.length === 0) {
@@ -262,22 +329,22 @@ async function getActiveTab() {
 async function getActiveWebTab() {
   // 1. Try active tab in last focused window
   let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (tabs.length > 0 && isWebUrl(tabs[0].url)) return tabs[0];
-  
+  if (tabs.length > 0 && isScriptableUrl(tabs[0].url)) return tabs[0];
+
   // 2. Try active tab in current window
   tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tabs.length > 0 && isWebUrl(tabs[0].url)) return tabs[0];
-  
+  if (tabs.length > 0 && isScriptableUrl(tabs[0].url)) return tabs[0];
+
   // 3. Try active tab in any window
   tabs = await chrome.tabs.query({ active: true });
-  const activeWebTabs = tabs.filter(t => isWebUrl(t.url));
+  const activeWebTabs = tabs.filter(t => isScriptableUrl(t.url));
   if (activeWebTabs.length > 0) return activeWebTabs[0];
-  
+
   // 4. Try any web tab at all
   tabs = await chrome.tabs.query({});
-  const webTabs = tabs.filter(t => isWebUrl(t.url));
+  const webTabs = tabs.filter(t => isScriptableUrl(t.url));
   if (webTabs.length > 0) return webTabs[0];
-  
+
   // 5. Fallback to active tab in last focused window
   return await getActiveTab();
 }
@@ -288,7 +355,7 @@ async function getTargetTab() {
       const tab = await chrome.tabs.get(targetTabId);
       if (tab) return tab;
     } catch (err) {
-      targetTabId = null; // Reset if tab closed/invalid
+      targetTabId = null;
     }
   }
   return await getActiveWebTab();
@@ -310,23 +377,55 @@ async function runInTab(func, args = [], tabId = null) {
     tab = await getTargetTab();
   }
   if (!tab) throw new Error('No target tab found');
-  
-  // Cannot script on chrome://, edge://, about: or chrome-extension:// pages
-  if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('edge://') || tab.url.startsWith('about:') || tab.url.startsWith('chrome-extension://')) {
-    throw new Error(`Cannot run browser automation on internal browser page: ${tab.url || 'empty'}`);
+
+  // Guard: Cannot script on non-web pages (chrome://, edge://, about:, devtools://)
+  if (!isScriptableUrl(tab.url)) {
+    throw new Error(`Cannot run browser automation on internal browser page: ${tab.url || 'empty'}. Switch to a regular web page first.`);
   }
 
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: func,
-    args: args
-  });
-
-  if (!results || results.length === 0) {
-    throw new Error('Script execution returned no results');
+  // Guard: Wait for tab to finish loading if it's still in 'loading' state
+  if (tab.status === 'loading') {
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 8000); // Safety timeout
+      function onUpdated(tId, changeInfo) {
+        if (tId === tab.id && changeInfo.status === 'complete') {
+          clearTimeout(timeout);
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        }
+      }
+      chrome.tabs.onUpdated.addListener(onUpdated);
+    });
+    // Re-fetch tab info after load
+    try {
+      tab = await chrome.tabs.get(tab.id);
+    } catch (e) {
+      throw new Error('Tab closed while waiting for it to load');
+    }
   }
 
-  return results[0].result;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: func,
+      args: args
+    });
+
+    if (!results || results.length === 0) {
+      throw new Error('Script execution returned no results');
+    }
+
+    return results[0].result;
+  } catch (err) {
+    // Provide a clearer message for the common "activeTab not in effect" error
+    if (err.message && err.message.includes('activeTab')) {
+      throw new Error(
+        `Permission denied for tab ${tab.id} (${tab.url}). ` +
+        `Make sure the extension has "All sites" access: right-click the extension icon → "This can read and change site data" → "On all sites".`
+      );
+    }
+    throw err;
+  }
 }
 
 // --- Injectable Content Functions ---
@@ -338,7 +437,6 @@ function executeRawJs(code) {
 
 function getContentInTab() {
   try {
-    // Extract document title and location
     const title = document.title;
     const url = window.location.href;
 
@@ -351,7 +449,6 @@ function getContentInTab() {
       };
     }
 
-    // 1. Traverse and build clean markdown
     function cleanText(str) {
       return str.replace(/\s+/g, ' ').trim();
     }
@@ -359,30 +456,26 @@ function getContentInTab() {
     function getElementSelector(el) {
       if (el.id) return `#${el.id}`;
       if (el.name) return `[name="${el.name}"]`;
-      
-      // Fallback: build a path
+
       let selector = el.tagName.toLowerCase();
-      if (el.className) {
+      if (el.className && typeof el.className === 'string') {
         const firstClass = el.className.split(' ')[0];
         if (firstClass && !firstClass.includes(':')) {
           selector += `.${firstClass}`;
         }
       }
-      
-      // Add text contents or placeholder identifiers if brief
+
       if (el.placeholder) {
         selector += `[placeholder="${el.placeholder}"]`;
       }
-      
+
       return selector;
     }
 
     const interactiveElements = [];
-    
-    // Helper to extract clickable/form items
+
     const inputs = document.querySelectorAll('input, textarea, select, button, a');
     inputs.forEach((el, index) => {
-      // Check if visible
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return;
       const style = window.getComputedStyle(el);
@@ -390,14 +483,13 @@ function getContentInTab() {
 
       const selector = getElementSelector(el);
       const text = cleanText(el.innerText || el.value || el.placeholder || '');
-      
+
       let type = 'element';
       if (el.tagName === 'A') type = 'link';
       else if (el.tagName === 'BUTTON' || el.type === 'button' || el.type === 'submit') type = 'button';
       else if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') type = 'input';
       else if (el.tagName === 'SELECT') type = 'select';
 
-      // Unique reference label
       const label = text ? `"${text}"` : (el.placeholder ? `placeholder "${el.placeholder}"` : `element ${index}`);
 
       interactiveElements.push({
@@ -415,8 +507,6 @@ function getContentInTab() {
       });
     });
 
-    // Convert main body to semantic Markdown
-    // Traverse DOM tree starting from body
     let markdown = '';
     function traverse(node) {
       if (node.nodeType === Node.TEXT_NODE) {
@@ -426,7 +516,7 @@ function getContentInTab() {
       }
 
       if (node.nodeType !== Node.ELEMENT_NODE) return;
-      
+
       const tagName = node.tagName.toLowerCase();
       const style = window.getComputedStyle(node);
       if (style && (style.display === 'none' || style.visibility === 'hidden')) return;
@@ -464,15 +554,14 @@ function getContentInTab() {
     }
 
     traverse(document.body);
-    
-    // Clean up markdown white space
+
     markdown = markdown.replace(/\n\s+\n/g, '\n\n').replace(/ +/g, ' ').trim();
 
     return {
       title,
       url,
       markdown,
-      interactive_elements: interactiveElements.slice(0, 100) // limit to top 100 for token efficiency
+      interactive_elements: interactiveElements.slice(0, 100)
     };
   } catch (err) {
     return {
@@ -486,24 +575,17 @@ function getContentInTab() {
 
 function clickElementInTab(selector) {
   try {
-    // Find element
     let el = null;
-    
-    // Helper to find element by CSS selector or XPath or Text Content
+
     if (selector.startsWith('//') || selector.startsWith('((')) {
-      // XPath
       const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
       el = result.singleNodeValue;
     } else {
-      // Try CSS selector
       try {
         el = document.querySelector(selector);
-      } catch (e) {
-        // If invalid selector, fallback to searching by text content
-      }
-      
+      } catch (e) { /* invalid selector, fall through */ }
+
       if (!el) {
-        // First try finding a table row tr or elements with role="row" containing the query text
         const query = selector.toLowerCase().replace(/['"]/g, '').trim();
         const rows = document.querySelectorAll('tr, [role="row"]');
         for (let row of rows) {
@@ -513,9 +595,8 @@ function clickElementInTab(selector) {
           }
         }
       }
-      
+
       if (!el) {
-        // Search by text content in typical clickables
         const query = selector.toLowerCase().replace(/['"]/g, '').trim();
         const clickables = document.querySelectorAll('a, button, input[type="button"], input[type="submit"], [role="button"]');
         for (let item of clickables) {
@@ -527,7 +608,6 @@ function clickElementInTab(selector) {
       }
 
       if (!el) {
-        // Search inputs by placeholder
         const inputs = document.querySelectorAll('input, textarea');
         for (let item of inputs) {
           if (item.placeholder && item.placeholder.toLowerCase().includes(selector.toLowerCase())) {
@@ -538,13 +618,11 @@ function clickElementInTab(selector) {
       }
 
       if (!el) {
-        // Fallback: Search the entire DOM for any visible leaf element containing the text query
         const allElements = document.querySelectorAll('*');
         for (let item of allElements) {
           if (item.innerText && item.innerText.includes(selector)) {
             const rect = item.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
-              // Check if it has child elements containing the same text (if not, it is the leaf node)
               let hasChildWithText = false;
               for (let child of item.children) {
                 if (child.innerText && child.innerText.includes(selector)) {
@@ -566,22 +644,17 @@ function clickElementInTab(selector) {
       throw new Error(`Element not found matching selector or text: "${selector}"`);
     }
 
-    // Highlight element
     const originalStyle = el.getAttribute('style') || '';
     el.style.outline = '3px solid #7c3aed';
     el.style.outlineOffset = '2px';
     el.style.transition = 'outline 0.3s ease';
-    
-    // Scroll into view
+
     el.scrollIntoView({ block: 'center', behavior: 'smooth' });
 
-    // Simulate click
     setTimeout(() => {
-      // Restore style
       el.setAttribute('style', originalStyle);
     }, 1000);
 
-    // Trigger events
     const mouseOverEvent = new MouseEvent('mouseover', { bubbles: true, cancelable: true });
     const mouseDownEvent = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
     const mouseUpEvent = new MouseEvent('mouseup', { bubbles: true, cancelable: true });
@@ -593,7 +666,6 @@ function clickElementInTab(selector) {
     el.dispatchEvent(mouseUpEvent);
     el.dispatchEvent(clickEvent);
 
-    // If it's a link with a href, we can also verify navigation
     return { success: true, element: el.tagName.toLowerCase(), selector };
   } catch (err) {
     return { success: false, error: err.message, selector };
@@ -606,9 +678,8 @@ function typeTextInTab(selector, text) {
     try {
       el = document.querySelector(selector);
     } catch (e) {}
-    
+
     if (!el) {
-      // Try finding by placeholder
       const inputs = document.querySelectorAll('input, textarea');
       for (let item of inputs) {
         if (item.placeholder && item.placeholder.toLowerCase().includes(selector.toLowerCase())) {
@@ -626,39 +697,35 @@ function typeTextInTab(selector, text) {
       throw new Error(`Input element not found matching: "${selector}"`);
     }
 
-    // Highlight element
     const originalStyle = el.getAttribute('style') || '';
     el.style.outline = '3px solid #06b6d4';
     el.style.outlineOffset = '2px';
-    
+
     el.scrollIntoView({ block: 'center', behavior: 'smooth' });
     el.focus();
 
-    // Clear value
     el.value = '';
-    
-    // Set value and trigger events character by character to satisfy input listeners
+
     let currentVal = '';
     for (let i = 0; i < text.length; i++) {
       const char = text[i];
       currentVal += char;
-      
+
       const keydown = new KeyboardEvent('keydown', { key: char, charCode: char.charCodeAt(0), bubbles: true });
       const keypress = new KeyboardEvent('keypress', { key: char, charCode: char.charCodeAt(0), bubbles: true });
-      
+
       el.dispatchEvent(keydown);
       el.dispatchEvent(keypress);
-      
+
       el.value = currentVal;
-      
+
       const inputEvent = new Event('input', { bubbles: true });
       el.dispatchEvent(inputEvent);
-      
+
       const keyup = new KeyboardEvent('keyup', { key: char, charCode: char.charCodeAt(0), bubbles: true });
       el.dispatchEvent(keyup);
     }
 
-    // Trigger change event
     const changeEvent = new Event('change', { bubbles: true });
     el.dispatchEvent(changeEvent);
 
@@ -688,7 +755,6 @@ function scrollInTab(direction, amount) {
 
 function waitInTab(selector, timeout = 5000) {
   return new Promise((resolve, reject) => {
-    // Check if selector is a time delay (number)
     const delay = parseInt(selector);
     if (!isNaN(delay) && String(delay) === String(selector)) {
       setTimeout(() => {
@@ -697,7 +763,6 @@ function waitInTab(selector, timeout = 5000) {
       return;
     }
 
-    // Otherwise wait for selector
     const start = Date.now();
     const interval = setInterval(() => {
       const el = document.querySelector(selector);
@@ -716,21 +781,18 @@ function gmailSearchInTab(query) {
   try {
     const q = document.querySelector('input[name="q"]');
     if (!q) throw new Error('Search input not found');
-    
+
     q.focus();
     q.value = query;
-    
-    // Dispatch input/change events to notify React/Angular/Gmail JS
+
     q.dispatchEvent(new Event('input', { bubbles: true }));
     q.dispatchEvent(new Event('change', { bubbles: true }));
-    
-    // Dispatch Enter key events to trigger the search trigger handlers
+
     const keyOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true };
     q.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
     q.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
     q.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
-    
-    // Also try clicking the search button as a backup
+
     const form = q.closest('form');
     if (form) {
       const searchBtn = form.querySelector('button[aria-label="Search mail"]') || form.querySelector('button') || document.querySelector('button.gb_1e');
