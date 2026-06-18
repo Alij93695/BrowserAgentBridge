@@ -1,0 +1,38 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and databases
+*.log
+webbridge.log
+
+# Screenshots and temp images
+screenshot.jpg
+gmail_search_view.jpg
+*.jpg
+
+# Temporary scratch folders
+scratch/
+
+# Personal email/data extracts (never commit these)
+email_*.txt
+actual_gmail_inbox_content.txt
+gmail_search_content.txt
+gmail_search_content_tab2.txt
+gmail_search_markdown.txt
+
+# Agent helper script (personal automation, not part of the bridge)
+agent.py
+
+# Local configuration and environment
+.env
+.venv
+venv/
+ENV/
+env/
+.agents/
+
+# OS specific files
+.DS_Store
+Thumbs.db

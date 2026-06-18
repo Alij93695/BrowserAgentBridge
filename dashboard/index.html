@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Antigravity WebBridge Dashboard - Browser Control Center</title>
+  <meta name="description" content="A premium telemetry dashboard for Antigravity WebBridge, providing real-time browser control, active tab views, console logs, and visual feedback for AI agents.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="main-header" id="dashboard-header">
+      <div class="header-logo">
+        <div class="logo-icon">AG</div>
+        <div class="logo-text">
+          <h1>Antigravity <span>WebBridge</span></h1>
+          <p class="subtitle">AI Browser Automation Console</p>
+        </div>
+      </div>
+      <div class="header-status">
+        <div id="connection-badge" class="badge badge-disconnected">
+          <span class="pulse-dot"></span>
+          <span id="connection-text">Disconnected</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Controls & Telemetry -->
+      <section class="panel-column left-column">
+        <!-- Navigate & Control Panel -->
+        <div class="glass-card panel-card" id="control-panel">
+          <div class="card-header">
+            <h2>Browser Actions</h2>
+          </div>
+          <div class="card-content">
+            <form id="url-form" class="control-input-group">
+              <input type="text" id="url-input" placeholder="Enter URL (e.g., google.com)" required>
+              <button type="submit" id="btn-navigate">Navigate</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Open Tabs List -->
+        <div class="glass-card panel-card flex-grow" id="tabs-panel">
+          <div class="card-header">
+            <h2>Open Tabs</h2>
+            <span id="tab-count-badge" class="count-badge">0 tabs</span>
+          </div>
+          <div class="card-content scrollable">
+            <div id="tabs-list" class="tabs-list-container">
+              <div class="empty-state">No open tabs found. Connect browser extension.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Console Logs -->
+        <div class="glass-card panel-card" id="logs-panel">
+          <div class="card-header">
+            <h2>System Logs</h2>
+            <button id="btn-clear-logs" class="btn-text">Clear</button>
+          </div>
+          <div class="card-content console-container">
+            <div id="console-logs" class="console-logs-list">
+              <div class="log-entry system">[System] Welcome to Antigravity WebBridge. Start daemon and extension to begin.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Visual Feedback & Command Playground -->
+      <section class="panel-column right-column">
+        <!-- Live Browser Viewport -->
+        <div class="glass-card panel-card flex-grow" id="viewport-panel">
+          <div class="card-header">
+            <div class="browser-address-bar">
+              <div class="browser-dot dot-red"></div>
+              <div class="browser-dot dot-yellow"></div>
+              <div class="browser-dot dot-green"></div>
+              <div class="address-display" id="active-tab-address">about:blank</div>
+              <button id="btn-refresh-view" class="btn-icon" title="Refresh Live View">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="card-content viewport-content" id="viewport-container">
+            <!-- Simulated Browser Screen -->
+            <div id="live-screen-placeholder" class="live-screen-placeholder">
+              <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1.5" fill="none" class="animate-pulse">
+                <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                <line x1="8" y1="21" x2="16" y2="21"/>
+                <line x1="12" y1="17" x2="12" y2="21"/>
+              </svg>
+              <p>Waiting for live browser feed...</p>
+              <span class="subtext">Make sure the Antigravity extension is installed and active in Chrome.</span>
+            </div>
+            <img id="live-screenshot" src="" alt="Live browser viewport" class="hidden">
+          </div>
+        </div>
+
+        <!-- Command Playground -->
+        <div class="glass-card panel-card" id="playground-panel">
+          <div class="card-header">
+            <h2>Command Playground</h2>
+          </div>
+          <div class="card-content playground-container">
+            <div class="playground-row">
+              <div class="form-group flex-2">
+                <label for="select-action">Action</label>
+                <select id="select-action">
+                  <option value="get_content">Get Content (Markdown)</option>
+                  <option value="click">Click Element</option>
+                  <option value="type">Type Text</option>
+                  <option value="scroll">Scroll Page</option>
+                  <option value="wait">Wait Selector / Delay</option>
+                  <option value="screenshot">Capture Screenshot</option>
+                </select>
+              </div>
+              <div class="form-group flex-3" id="playground-param-container">
+                <label for="input-param" id="playground-param-label">Parameter</label>
+                <input type="text" id="input-param" placeholder="Click selector or text">
+              </div>
+              <div class="form-group flex-3 hidden" id="playground-text-container">
+                <label for="input-text">Text to Type</label>
+                <input type="text" id="input-text" placeholder="Enter text">
+              </div>
+              <div class="form-group flex-1 align-self-end">
+                <button id="btn-run-cmd" class="btn-primary">Execute</button>
+              </div>
+            </div>
+            <div class="playground-result-container">
+              <label>Execution Output</label>
+              <pre id="playground-result" class="console-result">Ready.</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
