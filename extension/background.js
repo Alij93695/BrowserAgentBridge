@@ -208,7 +208,16 @@ async function handleCommand(action, params = {}) {
 
     // Page-level actions that run scripts inside the tab
     case 'get_content':
-      return await runInTab(getContentInTab, [], tabId);
+      const contentRes = await runInTab(getContentInTab, [], tabId);
+      let actualTabId = tabId;
+      if (!actualTabId) {
+        const resolvedTab = await getTargetTab();
+        if (resolvedTab) actualTabId = resolvedTab.id;
+      }
+      if (contentRes && typeof contentRes === 'object') {
+        contentRes.tab_id = actualTabId;
+      }
+      return contentRes;
     case 'click':
       return await runInTab(clickElementInTab, [params.selector], tabId);
     case 'type':
