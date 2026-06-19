@@ -15,9 +15,15 @@ function updateUI(connected) {
   }
 }
 
-// Initial check
+// Initial check & request reconnect from background service worker
 chrome.storage.local.get(['connected'], (result) => {
   updateUI(result.connected || false);
+  if (!result.connected) {
+    chrome.runtime.sendMessage({ action: 'reconnect' }, (response) => {
+      // Ignore error if background page is not fully loaded/ready
+      if (chrome.runtime.lastError) { /* ignore */ }
+    });
+  }
 });
 
 // Listen for changes

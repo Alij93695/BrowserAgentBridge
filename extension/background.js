@@ -2,8 +2,8 @@
 const WS_URL = 'ws://localhost:1313/ws';
 let ws = null;
 let reconnectTimer = null;
-let reconnectDelay = 1000;
-const MAX_RECONNECT_DELAY = 60000; // Cap at 60s to avoid flooding console
+let reconnectDelay = 5000; // Start with 5s delay
+const MAX_RECONNECT_DELAY = 300000; // Cap at 5 minutes to avoid flooding console
 let targetTabId = null;
 
 // --- Screenshot Rate Limiter ---
@@ -821,3 +821,14 @@ function gmailSearchInTab(query) {
     return { success: false, error: err.message };
   }
 }
+
+// Listen for message from popup to force reconnect
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'reconnect') {
+    console.log('BrowserAgentBridge: Reconnect triggered from popup.');
+    reconnectDelay = 5000;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    connect();
+    sendResponse({ success: true });
+  }
+});
