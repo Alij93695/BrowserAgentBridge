@@ -556,6 +556,7 @@ function getContentInTab() {
         placeholder: el.placeholder || '',
         selector,
         label,
+        href: el.tagName === 'A' ? el.href : '',
         rect: {
           x: Math.round(rect.left + window.scrollX),
           y: Math.round(rect.top + window.scrollY),
