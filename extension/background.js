@@ -618,16 +618,29 @@ function getContentInTab() {
 
     const identityElements = [];
     try {
-      const all = document.querySelectorAll('*');
-      all.forEach(el => {
-        if (el.childNodes.length > 0 && Array.from(el.childNodes).some(n => n.nodeType === 3 && n.textContent.includes('Identity info'))) {
-          identityElements.push({
-            tagName: el.tagName,
-            className: el.className,
-            outerHTML: el.outerHTML.slice(0, 150)
-          });
+      function findTextNodes(node, searchText, results) {
+        if (!node) return;
+        if (node.nodeType === 3 && node.textContent && node.textContent.includes(searchText)) {
+          if (node.parentNode) {
+            results.push({
+              tagName: node.parentNode.tagName,
+              className: node.parentNode.className,
+              outerHTML: node.parentNode.outerHTML.slice(0, 150)
+            });
+          }
         }
-      });
+        if (node.childNodes) {
+          for (let child of node.childNodes) {
+            findTextNodes(child, searchText, results);
+          }
+        }
+        if (node.shadowRoot) {
+          for (let child of node.shadowRoot.childNodes) {
+            findTextNodes(child, searchText, results);
+          }
+        }
+      }
+      findTextNodes(document.body, 'Identity info', identityElements);
     } catch(e) {}
 
     return {
