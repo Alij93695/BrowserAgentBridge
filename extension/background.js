@@ -616,11 +616,26 @@ function getContentInTab() {
 
     markdown = markdown.replace(/\n\s+\n/g, '\n\n').replace(/ +/g, ' ').trim();
 
+    const identityElements = [];
+    try {
+      const all = document.querySelectorAll('*');
+      all.forEach(el => {
+        if (el.childNodes.length > 0 && Array.from(el.childNodes).some(n => n.nodeType === 3 && n.textContent.includes('Identity info'))) {
+          identityElements.push({
+            tagName: el.tagName,
+            className: el.className,
+            outerHTML: el.outerHTML.slice(0, 150)
+          });
+        }
+      });
+    } catch(e) {}
+
     return {
       title,
       url,
       markdown,
-      interactive_elements: interactiveElements.slice(0, 100)
+      interactive_elements: interactiveElements.slice(0, 100),
+      identity_elements: identityElements
     };
   } catch (err) {
     return {
