@@ -87,7 +87,7 @@ function connect() {
 
   ws.onopen = () => {
     console.log('BrowserAgentBridge: Connected to Daemon');
-    reconnectDelay = 1000; // Reset backoff on successful connect
+    reconnectDelay = 5000; // Reset backoff on successful connect
     chrome.storage.local.set({ connected: true });
     sendToDaemon({ type: 'status', status: 'connected' });
     startHeartbeat();
@@ -162,6 +162,31 @@ function sendToDaemon(data) {
 
 // Start connection
 connect();
+
+// Schedule a periodic connection check alarm (runs even if service worker is suspended)
+chrome.alarms.get('checkConnection', (alarm) => {
+  if (!alarm) {
+    chrome.alarms.create('checkConnection', { periodInMinutes: 1 });
+  }
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'checkConnection') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.log('BrowserAgentBridge: Connection check alarm fired. Attempting to connect...');
+      connect();
+    }
+  }
+});
+
+// Wake up and connect on navigation events (to ensure fast connection when active)
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId === 0) { // Only main frame navigations
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      connect();
+    }
+  }
+});
 
 // --- Command Handler Router ---
 
