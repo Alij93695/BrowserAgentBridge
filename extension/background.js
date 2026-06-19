@@ -51,11 +51,19 @@ async function _captureScreenshot() {
     const tab = await getTargetTab();
     if (!tab) throw new Error('No target tab found');
 
+    // Guard: Do not attempt to capture screenshots on internal/restricted tabs
+    if (!isScriptableUrl(tab.url)) {
+      return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+    }
+
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 75 });
     return dataUrl;
   } catch (err) {
-    // Graceful fallback — return 1x1 transparent PNG so callers don't crash
-    console.warn('Screenshot capture failed (expected for background/internal tabs):', err.message);
+    // Only log warning if it is not a known/expected permission error to keep console clean
+    const msg = err.message || '';
+    if (!msg.includes('activeTab') && !msg.includes('permission') && !msg.includes('Cannot access') && !msg.includes('not allowed')) {
+      console.warn('Screenshot capture failed:', msg);
+    }
     return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
   }
 }
