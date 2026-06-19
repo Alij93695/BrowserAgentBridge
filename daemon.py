@@ -308,5 +308,5 @@ except Exception as e:
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting BrowserAgentBridge Daemon on http://localhost:1313")
+    logger.info("Starting BrowserAgentBridge Daemon on http://127.0.0.1:1313")
     uvicorn.run(app, host="127.0.0.1", port=1313)

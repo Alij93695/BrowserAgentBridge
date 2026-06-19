@@ -1,5 +1,5 @@
 // BrowserAgentBridge - Extension Background Service Worker
-const WS_URL = 'ws://localhost:1313/ws';
+const WS_URL = 'ws://127.0.0.1:1313/ws';
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelay = 5000; // Start with 5s delay
