@@ -123,6 +123,15 @@ Executes a browser or page-level action.
 | `wait`      | `selector` (str/int), `timeout` (int, optional), `tab_id` (int, optional) | Waits for an element to appear, or pauses for `timeout` milliseconds. |
 | `execute`   | `code` (str), `tab_id` (int, optional) | Runs arbitrary JavaScript inside the tab context. |
 
+#### Smart Form Commands (v1.1.0+):
+| Action | Parameter | Description |
+| :--- | :--- | :--- |
+| `fill_form` | `fields` (object), `submit` (bool, optional), `tab_id` (int, optional) | Fill multiple form fields at once using human-readable labels. Fields is a `{label: value}` map. Checkboxes accept `true`/`false`. Set `submit: true` to auto-submit. |
+| `smart_fill`| `target` (str), `value` (str/bool), `tab_id` (int, optional) | Fill a single field by its visible label, placeholder, or aria-label. No CSS selector needed. |
+| `smart_click` | `target` (str), `tab_id` (int, optional) | Click a button, link, or element by its visible text. Uses full mouse event sequence (mousedown → mouseup → click). |
+| `press_key` | `key` (str), `modifiers` (array, optional), `tab_id` (int, optional) | Dispatch a keyboard event. `key` uses [KeyboardEvent.key](https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/key) values (e.g., `"Enter"`, `"Tab"`, `"a"`). `modifiers` can include `"ctrl"`, `"shift"`, `"alt"`, `"meta"`. |
+| `clear_input` | `target` (str), `tab_id` (int, optional) | Clear any input field by its visible label, placeholder, or CSS selector. |
+
 ---
 
 ## Python Background Automation Example
@@ -171,6 +180,47 @@ print(page_data.get("markdown")[:1000]) # First 1000 characters
 # 5. Clean up by closing the background tab
 run_command("close_tab", {"tab_id": tab_id})
 print("Background tab closed.")
+```
+
+---
+
+## Smart Form Automation Example
+
+The smart form commands let you fill forms using **visible field labels** instead of CSS selectors — just like a human would. See [`example_form_filler.py`](example_form_filler.py) for a complete runnable demo.
+
+Quick example using `curl`:
+
+```bash
+# Fill multiple fields at once
+curl -X POST http://localhost:1313/api/command \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "fill_form",
+    "params": {
+      "fields": {
+        "First Name": "Jane",
+        "Last Name": "Doe",
+        "Email": "jane@example.com",
+        "Subscribe": true
+      },
+      "submit": true
+    }
+  }'
+
+# Click a button by its visible text
+curl -X POST http://localhost:1313/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"action": "smart_click", "params": {"target": "Sign Up"}}'
+
+# Fill a single field by label
+curl -X POST http://localhost:1313/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"action": "smart_fill", "params": {"target": "Password", "value": "s3cret"}}'
+```
+
+Run the full demo:
+```bash
+python example_form_filler.py
 ```
 
 ## License

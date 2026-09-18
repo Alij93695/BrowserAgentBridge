@@ -437,6 +437,33 @@ async function handleCommand(action, params = {}) {
         return results;
       }, [], tabId);
 
+    case 'smart_fill': {
+      const field = params.target || params.field;
+      const res = await runInTab(fillFormInTab, [{ [field]: params.value }, false], tabId);
+      if (res && res.fields && res.fields[field]) {
+        return res.fields[field];
+      }
+      return res;
+    }
+
+    case 'fill_form':
+      return await runInTab(fillFormInTab, [params.fields, params.submit || false, params.submitLabel || 'submit'], tabId);
+
+    case 'smart_click':
+      return await runInTab(smartClickInTab, [params.target, params.role || null], tabId);
+
+    case 'press_key':
+      return await runInTab(pressKeyInTab, [params.key, params.selector || null, params.modifiers || []], tabId);
+
+    case 'clear_input': {
+      const field = params.target || params.selector || params.field;
+      const res = await runInTab(fillFormInTab, [{ [field]: '' }, false], tabId);
+      if (res && res.fields && res.fields[field]) {
+        return res.fields[field];
+      }
+      return res;
+    }
+
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1244,6 +1271,402 @@ async function findAndClickProductionInTab() {
     return { success: false, error: err.message };
   }
 }
+
+// --- Smart Human-Like Form Automation Engine ---
+
+async function fillFormInTab(fields, autoSubmit = false, submitLabel = 'submit') {
+  function smartFindField(query, root = document) {
+    if (!query) return null;
+    const q = String(query).toLowerCase().trim();
+
+    // 0. Direct CSS selector match (#id, .class, [name=...], input[type=...])
+    try {
+      const el = root.querySelector(query);
+      if (el) return el;
+    } catch (e) {}
+
+    // 1. Direct ID or Name match
+    try {
+      let el = root.querySelector(`input#${CSS.escape(query)}, textarea#${CSS.escape(query)}, select#${CSS.escape(query)}`);
+      if (!el) {
+        el = root.querySelector(`[name="${CSS.escape(query)}"], [name="${CSS.escape(q)}"]`);
+      }
+      if (el) return el;
+    } catch (e) {}
+
+    // 2. <label> matching
+    const labels = Array.from(root.querySelectorAll('label'));
+    for (const lbl of labels) {
+      const lblText = (lbl.innerText || lbl.textContent || '').toLowerCase().trim();
+      if (lblText.includes(q) || q.includes(lblText)) {
+        const forId = lbl.getAttribute('for');
+        if (forId) {
+          try {
+            const target = root.getElementById ? root.getElementById(forId) : root.querySelector(`#${CSS.escape(forId)}`);
+            if (target) return target;
+          } catch (e) {}
+        }
+        const wrapped = lbl.querySelector('input, textarea, select, [contenteditable="true"]');
+        if (wrapped) return wrapped;
+      }
+    }
+
+    // 3. aria-label, placeholder, title, name, id, value on inputs
+    const inputs = Array.from(root.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]'));
+    for (const item of inputs) {
+      const aria = (item.getAttribute('aria-label') || '').toLowerCase().trim();
+      const ph = (item.getAttribute('placeholder') || '').toLowerCase().trim();
+      const title = (item.getAttribute('title') || '').toLowerCase().trim();
+      const name = (item.getAttribute('name') || '').toLowerCase().trim();
+      const id = (item.id || '').toLowerCase().trim();
+      const val = (item.value || '').toLowerCase().trim();
+      if (aria === q || ph === q || name === q || id === q || val === q) return item;
+      if ((aria && aria.includes(q)) || (ph && ph.includes(q)) || (name && name.includes(q)) || (id && id.includes(q)) || (title && title.includes(q))) {
+        return item;
+      }
+    }
+
+    // 4. Preceding sibling, floating label or parent container header
+    for (const item of inputs) {
+      const parent = item.closest('div, section, p, li, td, .form-group, .field, [class*="field"], [class*="input"], [class*="form"]');
+      if (parent) {
+        const textNodes = Array.from(parent.querySelectorAll('label, span, p, div, strong, b'));
+        for (const tNode of textNodes) {
+          if (tNode !== item && !tNode.contains(item)) {
+            const t = (tNode.innerText || tNode.textContent || '').toLowerCase().trim();
+            if (t && (t === q || t.includes(q))) {
+              return item;
+            }
+          }
+        }
+      }
+    }
+
+    // 5. Table rows: <tr><td>Label</td><td><input /></td></tr>
+    const rows = Array.from(root.querySelectorAll('tr, [role="row"]'));
+    for (const row of rows) {
+      const rowText = (row.innerText || '').toLowerCase();
+      if (rowText.includes(q)) {
+        const rowInput = row.querySelector('input, textarea, select, [contenteditable="true"]');
+        if (rowInput) return rowInput;
+      }
+    }
+
+    // 6. Deep Shadow DOM traversal
+    const allRoots = Array.from(root.querySelectorAll('*')).filter(e => e.shadowRoot);
+    for (const host of allRoots) {
+      const found = smartFindField(query, host.shadowRoot);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  function humanFillElement(el, value, options = {}) {
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    } catch (e) {}
+
+    // Visual highlight outline
+    const prevOutline = el.style.outline;
+    const prevOffset = el.style.outlineOffset;
+    el.style.outline = '2px solid #06b6d4';
+    el.style.outlineOffset = '2px';
+    setTimeout(() => {
+      try {
+        el.style.outline = prevOutline;
+        el.style.outlineOffset = prevOffset;
+      } catch (e) {}
+    }, 800);
+
+    // Focus
+    el.focus();
+    el.dispatchEvent(new (globalThis.FocusEvent || globalThis.Event)('focus', { bubbles: true }));
+
+    const tagName = el.tagName.toLowerCase();
+    const inputType = (el.type || '').toLowerCase();
+
+    // 1. Checkbox
+    if (inputType === 'checkbox') {
+      const targetState = (value === true || value === 'true' || value === 1 || value === '1' || value === 'check' || value === 'on');
+      if (el.checked !== targetState) {
+        el.checked = targetState;
+        el.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true }));
+        el.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+      }
+      return { success: true, type: 'checkbox', checked: el.checked };
+    }
+
+    // 2. Radio Button (with smart group auto-matching)
+    if (inputType === 'radio') {
+      if (typeof value === 'string' && el.name) {
+        try {
+          const group = Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(el.name)}"]`));
+          const targetRadio = group.find(r => {
+            const rVal = (r.value || '').toLowerCase();
+            const rParent = r.closest('label, p, div, li');
+            const rText = rParent ? (rParent.innerText || '').toLowerCase() : '';
+            return rVal === value.toLowerCase() || rText.includes(value.toLowerCase());
+          });
+          if (targetRadio) {
+            targetRadio.checked = true;
+            targetRadio.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true }));
+            targetRadio.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+            return { success: true, type: 'radio', checked: true, value: targetRadio.value };
+          }
+        } catch (e) {}
+      }
+      el.checked = true;
+      el.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true }));
+      el.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+      return { success: true, type: 'radio', checked: true };
+    }
+
+    // 3. Native <select> Dropdown
+    if (tagName === 'select') {
+      const valStr = String(value).toLowerCase().trim();
+      let matchedOption = null;
+      for (let i = 0; i < el.options.length; i++) {
+        const opt = el.options[i];
+        const optText = (opt.text || '').toLowerCase().trim();
+        const optVal = (opt.value || '').toLowerCase().trim();
+        if (optVal === valStr || optText === valStr || optText.includes(valStr) || valStr.includes(optText)) {
+          matchedOption = opt;
+          el.selectedIndex = i;
+          break;
+        }
+      }
+      if (matchedOption) {
+        el.dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+        el.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        return { success: true, type: 'select', selected: matchedOption.text, value: matchedOption.value };
+      }
+      return { success: false, type: 'select', error: `Option matching "${value}" not found in dropdown` };
+    }
+
+    // 4. Rich Text / Contenteditable (Gmail, Notion, Slack, Google Docs, ProseMirror, Lexical)
+    const isContentEditable = el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox';
+    if (isContentEditable) {
+      try {
+        document.execCommand('selectAll', false, null);
+        const ok = document.execCommand('insertText', false, String(value));
+        if (!ok) {
+          el.innerText = String(value);
+        }
+      } catch (e) {
+        el.innerText = String(value);
+      }
+      el.dispatchEvent(new (globalThis.InputEvent || globalThis.Event)('input', { bubbles: true, inputType: 'insertText', data: String(value) }));
+      el.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+      return { success: true, type: 'contenteditable', valueLength: String(value).length };
+    }
+
+    // 5. Standard inputs (text, email, password, number, tel, search, url, textarea)
+    const valStr = String(value);
+    const proto = tagName === 'textarea'
+      ? (globalThis.HTMLTextAreaElement ? globalThis.HTMLTextAreaElement.prototype : null)
+      : (globalThis.HTMLInputElement ? globalThis.HTMLInputElement.prototype : null);
+    const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+
+    if (el._valueTracker) {
+      try { el._valueTracker.setValue(''); } catch (e) {}
+    }
+
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(el, '');
+    } else {
+      el.value = '';
+    }
+    el.dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(el, valStr);
+    } else {
+      el.value = valStr;
+    }
+
+    el.dispatchEvent(new (globalThis.InputEvent || globalThis.Event)('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: valStr }));
+    el.dispatchEvent(new (globalThis.InputEvent || globalThis.Event)('input', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: valStr }));
+    el.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new (globalThis.FocusEvent || globalThis.Event)('blur', { bubbles: true }));
+
+    return { success: true, type: tagName, inputType, valueLength: valStr.length };
+  }
+
+  function clickSubmit(targetText) {
+    const q = String(targetText).toLowerCase().trim();
+    const clickables = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"], .btn, [class*="button"]'));
+    let bestMatch = null;
+    for (const item of clickables) {
+      const text = (item.innerText || item.value || item.getAttribute('aria-label') || '').toLowerCase().trim();
+      if (text === q || text.includes(q)) {
+        bestMatch = item;
+        break;
+      }
+    }
+    if (bestMatch) {
+      bestMatch.scrollIntoView({ block: 'center' });
+      bestMatch.click();
+      return true;
+    }
+    return false;
+  }
+
+  if (!fields || typeof fields !== 'object') {
+    return { success: false, error: 'fields parameter must be an object of { fieldName: value }' };
+  }
+
+  const results = {};
+  let totalSuccess = 0;
+  let totalFields = 0;
+
+  for (const [fieldName, val] of Object.entries(fields)) {
+    totalFields++;
+    const targetEl = smartFindField(fieldName);
+    if (!targetEl) {
+      results[fieldName] = { success: false, error: `Field "${fieldName}" not found on page` };
+      continue;
+    }
+
+    try {
+      const fillRes = humanFillElement(targetEl, val);
+      results[fieldName] = fillRes;
+      if (fillRes.success) totalSuccess++;
+    } catch (err) {
+      results[fieldName] = { success: false, error: err.message };
+    }
+
+    await new Promise(r => setTimeout(r, 60));
+  }
+
+  let submitted = false;
+  if (autoSubmit && totalSuccess > 0) {
+    await new Promise(r => setTimeout(r, 200));
+    submitted = clickSubmit(submitLabel);
+  }
+
+  return {
+    success: totalSuccess > 0,
+    filledCount: totalSuccess,
+    totalCount: totalFields,
+    submitted,
+    fields: results
+  };
+}
+
+function smartClickInTab(targetText, role = null) {
+  const q = String(targetText).toLowerCase().trim();
+  const clickables = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"], [role="tab"], [role="menuitem"], .btn, [class*="button"]'));
+
+  let bestMatch = null;
+  for (const item of clickables) {
+    const text = (item.innerText || item.value || item.getAttribute('aria-label') || '').toLowerCase().trim();
+    if (text === q) {
+      bestMatch = item;
+      break;
+    }
+  }
+
+  if (!bestMatch) {
+    for (const item of clickables) {
+      const text = (item.innerText || item.value || item.getAttribute('aria-label') || '').toLowerCase().trim();
+      if (text.includes(q)) {
+        bestMatch = item;
+        break;
+      }
+    }
+  }
+
+  if (!bestMatch) {
+    const all = Array.from(document.querySelectorAll('*'));
+    for (const item of all) {
+      if (item.children.length === 0) {
+        const text = (item.innerText || item.textContent || '').toLowerCase().trim();
+        if (text === q || (text && text.includes(q) && text.length < q.length + 20)) {
+          bestMatch = item.closest('button, a, [role="button"]') || item;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!bestMatch) {
+    return { success: false, error: `Clickable element matching "${targetText}" not found` };
+  }
+
+  bestMatch.scrollIntoView({ block: 'center', behavior: 'smooth' });
+
+  const prevStyle = bestMatch.getAttribute('style') || '';
+  bestMatch.style.outline = '3px solid #7c3aed';
+  bestMatch.style.outlineOffset = '2px';
+  setTimeout(() => {
+    try { bestMatch.setAttribute('style', prevStyle); } catch (e) {}
+  }, 600);
+
+  const mouseOpts = { bubbles: true, cancelable: true, view: window };
+  bestMatch.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseover', mouseOpts));
+  bestMatch.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseenter', mouseOpts));
+  bestMatch.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', mouseOpts));
+  try { bestMatch.focus(); } catch (e) {}
+  bestMatch.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseup', mouseOpts));
+  bestMatch.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', mouseOpts));
+
+  return {
+    success: true,
+    tag: bestMatch.tagName.toLowerCase(),
+    text: (bestMatch.innerText || bestMatch.value || '').trim().slice(0, 100)
+  };
+}
+
+function pressKeyInTab(keyName, selector = null, modifiers = []) {
+  let target = selector ? document.querySelector(selector) : document.activeElement;
+  if (!target) target = document.body;
+
+  const key = keyName;
+  const isEnter = key.toLowerCase() === 'enter';
+  const isTab = key.toLowerCase() === 'tab';
+  const isEscape = key.toLowerCase() === 'escape';
+  const code = isEnter ? 'Enter' : (isTab ? 'Tab' : (isEscape ? 'Escape' : key));
+  const keyCode = isEnter ? 13 : (isTab ? 9 : (isEscape ? 27 : (key.charCodeAt(0) || 0)));
+
+  const ctrlKey = modifiers.includes('ctrl') || modifiers.includes('control');
+  const shiftKey = modifiers.includes('shift');
+  const altKey = modifiers.includes('alt');
+  const metaKey = modifiers.includes('meta') || modifiers.includes('cmd') || modifiers.includes('command');
+
+  const eventOpts = {
+    key,
+    code,
+    keyCode,
+    which: keyCode,
+    bubbles: true,
+    cancelable: true,
+    ctrlKey,
+    shiftKey,
+    altKey,
+    metaKey,
+    view: window
+  };
+
+  target.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keydown', eventOpts));
+  target.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keypress', eventOpts));
+  target.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keyup', eventOpts));
+
+  if (isEnter && target.tagName === 'INPUT') {
+    const form = target.closest('form');
+    if (form) {
+      const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+      if (submitBtn) {
+        submitBtn.click();
+      } else {
+        form.dispatchEvent(new (globalThis.Event || Object)('submit', { bubbles: true, cancelable: true }));
+      }
+    }
+  }
+
+  return { success: true, key, target: target.tagName.toLowerCase() };
+}
+
 
 // Listen for message from popup/content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

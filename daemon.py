@@ -182,7 +182,7 @@ async def post_command(cmd: CommandRequest):
         result = await extension_manager.send_command(cmd.action, cmd.params, cmd.timeout)
         
         # If it was an action that could change page state, schedule a tab list & screenshot refresh
-        if cmd.action in ["click", "type", "navigate", "scroll", "select_tab", "new_tab", "close_tab"]:
+        if cmd.action in ["click", "type", "navigate", "scroll", "select_tab", "new_tab", "close_tab", "smart_fill", "fill_form", "smart_click", "press_key", "clear_input"]:
             # Run screenshot & tab update in background
             schedule_telemetry_refresh()
             
