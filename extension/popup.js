@@ -15,15 +15,32 @@ function updateUI(connected) {
   }
 }
 
+function triggerReconnect() {
+  chrome.runtime.sendMessage({ action: 'reconnect' }, (response) => {
+    if (chrome.runtime.lastError) { /* ignore */ }
+  });
+  try {
+    fetch('http://127.0.0.1:1313/api/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: 'info', message: 'Popup Reconnect button clicked' })
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('btn-reconnect');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      triggerReconnect();
+    });
+  }
+});
+
 // Initial check & request reconnect from background service worker
 chrome.storage.local.get(['connected'], (result) => {
   updateUI(result.connected || false);
-  if (!result.connected) {
-    chrome.runtime.sendMessage({ action: 'reconnect' }, (response) => {
-      // Ignore error if background page is not fully loaded/ready
-      if (chrome.runtime.lastError) { /* ignore */ }
-    });
-  }
+  triggerReconnect();
 });
 
 // Listen for changes

@@ -195,12 +195,13 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       
       const data = await response.json();
-      if (data.success) {
+      if (response.ok && data.success) {
         appendLog('success', `Action ${action} succeeded.`);
         return data.result;
       } else {
-        appendLog('error', `Action ${action} failed: ${data.error}`);
-        throw new Error(data.error);
+        const errorMsg = data.detail || data.error || `HTTP ${response.status} Error`;
+        appendLog('error', `Action ${action} failed: ${errorMsg}`);
+        throw new Error(errorMsg);
       }
     } catch (err) {
       appendLog('error', `API Request failed: ${err.message}`);

@@ -18,8 +18,11 @@ Unlike standard automation tools that steal screen focus or disrupt active brows
 ## Getting Started
 
 ### 1. Install the Chrome Extension
-1. Clone this repository locally.
-2. Open Chrome and navigate to `chrome://extensions/`.
+1. Clone this repository locally:
+   ```bash
+   git clone https://github.com/Alij93695/BrowserAgentBridge.git
+   ```
+2. Open Chrome (or Brave / Arc / Edge) and navigate to `chrome://extensions/`.
 3. Enable **Developer mode** (toggle in the top-right corner).
 4. Click **Load unpacked** and select the `extension` folder in this repository.
 
@@ -29,11 +32,44 @@ To allow the extension to run silently in the background:
 2. Under **Site access**, change the setting to **"On all sites"**. This ensures the extension can access background web tabs persistently without requiring manual activation clicks.
 
 ### 3. Start the Server
-Navigate to the root directory and start the Python daemon:
+
+#### Prerequisites
+Install required Python dependencies:
 ```bash
-python daemon.py
+pip install fastapi uvicorn websockets pydantic
 ```
-This launches a FastAPI server on `http://localhost:1313`. The extension will automatically connect to it via WebSockets.
+
+#### On macOS (MacBook):
+- **Start in foreground**:
+  ```bash
+  python3 daemon.py
+  ```
+- **Start in background**:
+  ```bash
+  ./start_daemon.sh
+  ```
+- **Stop background daemon**:
+  ```bash
+  ./stop_daemon.sh
+  ```
+- **Auto-start on login (macOS LaunchAgent)**:
+  ```bash
+  python3 setup_autostart.py
+  ```
+
+#### On Windows:
+- **Start in foreground**:
+  ```bash
+  python daemon.py
+  ```
+- **Auto-start on login / background**:
+  ```bash
+  python setup_autostart.py
+  ```
+- **Stop background daemon**:
+  Double-click or run `stop_daemon.bat`.
+
+Once started, the daemon listens on `http://127.0.0.1:1313`. The extension will automatically connect to it via WebSockets. You can view the live telemetry dashboard by opening `http://127.0.0.1:1313/` in your browser.
 
 ---
 

@@ -3,7 +3,7 @@ const WS_URL = 'ws://127.0.0.1:1313/ws';
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelay = 5000; // Start with 5s delay
-const MAX_RECONNECT_DELAY = 300000; // Cap at 5 minutes to avoid flooding console
+const MAX_RECONNECT_DELAY = 10000; // Cap at 10 seconds for fast reconnection
 let targetTabId = null;
 
 // --- Screenshot Rate Limiter ---
@@ -36,10 +36,17 @@ async function throttledScreenshot() {
     const result = await _captureScreenshot();
     // Resolve any queued callers with the same result
     for (const resolver of pendingScreenshotResolvers) {
-      resolver(result);
+      try { resolver(result); } catch (e) {}
     }
     pendingScreenshotResolvers = [];
     return result;
+  } catch (err) {
+    const fallback = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+    for (const resolver of pendingScreenshotResolvers) {
+      try { resolver(fallback); } catch (e) {}
+    }
+    pendingScreenshotResolvers = [];
+    return fallback;
   } finally {
     lastScreenshotTime = Date.now();
     screenshotInFlight = false;
@@ -68,26 +75,67 @@ async function _captureScreenshot() {
   }
 }
 
-// --- WebSocket Connection (with smart backoff & silent reconnect) ---
+// --- Remote & Local Logging System ---
+function extLog(level, msg) {
+  const timestamp = new Date().toISOString();
+  const formatted = `[${timestamp}] [${level.toUpperCase()}] ${msg}`;
+  console.log('BrowserAgentBridge:', formatted);
+  
+  chrome.storage.local.get(['extLogs'], (res) => {
+    const logs = (res && res.extLogs) ? res.extLogs : [];
+    logs.push(formatted);
+    if (logs.length > 50) logs.shift();
+    chrome.storage.local.set({ extLogs: logs });
+  });
+
+  try {
+    fetch('http://127.0.0.1:1313/api/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: level, message: msg })
+    }).catch(() => {});
+  } catch (e) {
+    // Ignore fetch errors
+  }
+}
+
+const WS_URLS = ['ws://127.0.0.1:1313/ws', 'ws://localhost:1313/ws'];
+let wsIndex = 0;
+
+function shouldConnect() {
+  return !ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING;
+}
 
 function connect() {
-  // Clean up any existing connection
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    return; // Already connecting or connected
+  }
+
+  const targetUrl = WS_URLS[wsIndex % WS_URLS.length];
+  extLog('info', 'Attempting WebSocket connection to ' + targetUrl);
+  reconnectDelay = 2000; // Reset backoff on explicit connect attempt
+  // Clean up any existing closed connection
   if (ws) {
     try { ws.close(); } catch (e) { /* ignore */ }
     ws = null;
   }
 
   try {
-    ws = new WebSocket(WS_URL);
+    ws = new WebSocket(targetUrl);
   } catch (err) {
-    // WebSocket constructor failed (very rare). Schedule silent retry.
+    extLog('error', 'WebSocket constructor failed: ' + err.message);
+    wsIndex++;
     scheduleReconnect();
     return;
   }
 
   ws.onopen = () => {
-    console.log('BrowserAgentBridge: Connected to Daemon');
-    reconnectDelay = 5000; // Reset backoff on successful connect
+    extLog('info', 'WebSocket Connected successfully to Daemon at ' + targetUrl);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    reconnectDelay = 3000; // Reset backoff on successful connect
     chrome.storage.local.set({ connected: true });
     sendToDaemon({ type: 'status', status: 'connected' });
     startHeartbeat();
@@ -104,25 +152,26 @@ function connect() {
         const result = await handleCommand(action, params);
         sendToDaemon({ id, success: true, result });
       } catch (err) {
-        console.error('Error executing command:', err);
+        extLog('error', 'Error executing command ' + action + ': ' + err.message);
         sendToDaemon({ id, success: false, error: err.message });
       }
     } catch (err) {
-      console.error('Error parsing daemon message:', err);
+      extLog('error', 'Error parsing daemon message: ' + err.message);
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (evt) => {
+    extLog('warn', 'WebSocket connection closed (code: ' + (evt ? evt.code : 'unknown') + ')');
     chrome.storage.local.set({ connected: false });
     stopHeartbeat();
     scheduleReconnect();
   };
 
-  ws.onerror = () => {
-    // Suppress noisy "WebSocket error: [object Event]" — the onclose handler
-    // already manages reconnection. Only log at debug level.
+  ws.onerror = (err) => {
+    extLog('error', 'WebSocket error event triggered');
     chrome.storage.local.set({ connected: false });
     stopHeartbeat();
+    scheduleReconnect();
   };
 }
 
@@ -149,7 +198,6 @@ function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
     connect();
-    // Exponential backoff: 1s → 2s → 4s → 8s → ... → 60s max
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
   }, reconnectDelay);
 }
@@ -160,33 +208,61 @@ function sendToDaemon(data) {
   }
 }
 
-// Start connection
-connect();
-
-// Schedule a periodic connection check alarm (runs even if service worker is suspended)
-chrome.alarms.get('checkConnection', (alarm) => {
-  if (!alarm) {
+// Register Service Worker lifecycle event listeners
+chrome.runtime.onInstalled.addListener(() => {
+  extLog('info', 'Extension Installed/Reloaded lifecycle event');
+  try {
     chrome.alarms.create('checkConnection', { periodInMinutes: 1 });
+  } catch (e) {
+    console.warn('Alarm creation error:', e);
   }
+  if (shouldConnect()) connect();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  extLog('info', 'Extension Startup lifecycle event');
+  if (shouldConnect()) connect();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'checkConnection') {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.log('BrowserAgentBridge: Connection check alarm fired. Attempting to connect...');
+    if (shouldConnect()) {
+      extLog('info', 'Connection check alarm fired. Triggering connect...');
       connect();
     }
   }
 });
 
-// Wake up and connect on navigation events (to ensure fast connection when active)
+// Wake up and connect on navigation and tab events (to ensure fast connection when active)
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) { // Only main frame navigations
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (shouldConnect()) {
+      extLog('info', 'WebNavigation committed event. Triggering connect...');
       connect();
     }
   }
 });
+
+chrome.tabs.onActivated.addListener(() => {
+  if (shouldConnect()) {
+    extLog('info', 'Tab activated event. Triggering connect...');
+    connect();
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'complete' || changeInfo.url) {
+    if (shouldConnect()) {
+      extLog('info', 'Tab updated event. Triggering connect...');
+      connect();
+    }
+  }
+});
+
+// Safe deferred initial connection after top-level script evaluation completes
+setTimeout(() => {
+  connect();
+}, 100);
 
 // --- Command Handler Router ---
 
@@ -218,6 +294,102 @@ async function handleCommand(action, params = {}) {
         contentRes.tab_id = actualTabId;
       }
       return contentRes;
+    case 'click_manage_by_index':
+      return await runInTab((idx) => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const manageButtons = buttons.filter(b => b.innerText.trim() === 'Manage');
+        if (idx < manageButtons.length) {
+          const el = manageButtons[idx];
+          el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          el.click();
+          return { success: true };
+        }
+        return { success: false, error: `Index ${idx} out of range (found ${manageButtons.length})` };
+      }, [params.index], tabId);
+    case 'get_app_access_details':
+      return await runInTab(() => {
+        const inputs = Array.from(document.querySelectorAll('input'));
+        const info = inputs.map((inp, idx) => ({
+          idx,
+          id: inp.id,
+          type: inp.type,
+          checked: inp.checked,
+          value: inp.value,
+          label: inp.nextElementSibling ? inp.nextElementSibling.innerText : ''
+        }));
+        const text = document.body.innerText;
+        return { inputs: info, textSnippet: text.slice(0, 1000) };
+      }, [], tabId);
+    case 'inspect_inputs_detailed':
+      return await runInTab(() => {
+        const elements = Array.from(document.querySelectorAll('input, textarea'));
+        return elements.map((el, idx) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            idx,
+            tag: el.tagName.toLowerCase(),
+            type: el.type || '',
+            id: el.id,
+            className: el.className,
+            placeholder: el.placeholder || '',
+            value: el.value || '',
+            width: rect.width,
+            height: rect.height,
+            visible: rect.width > 0 && rect.height > 0
+          };
+        });
+      }, [], tabId);
+    case 'select_yes_radio':
+      return await runInTab(() => {
+        const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+        if (radios.length > 0) {
+          const yesRadio = radios[0];
+          yesRadio.click();
+          yesRadio.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+          yesRadio.dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+          return { success: true };
+        }
+        return { success: false, error: 'No radios found' };
+      }, [], tabId);
+    case 'fill_app_access_inputs':
+      return await runInTab((name, username, password, extraInfo) => {
+        const textInputs = Array.from(document.querySelectorAll('input.mdc-text-field__input'));
+        if (textInputs.length < 3) {
+          return { success: false, error: `Only found ${textInputs.length} text inputs` };
+        }
+        textInputs[0].value = name;
+        textInputs[0].dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+        textInputs[0].dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        
+        textInputs[1].value = username;
+        textInputs[1].dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+        textInputs[1].dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        
+        textInputs[2].value = password;
+        textInputs[2].dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+        textInputs[2].dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        
+        const textarea = document.querySelector('textarea.mdc-text-field__input');
+        if (textarea) {
+          textarea.value = extraInfo;
+          textarea.dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+          textarea.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        }
+        
+        const checkbox = document.querySelector('input.mdc-checkbox__native-control, input[type="checkbox"]');
+        if (checkbox && !checkbox.checked) {
+          checkbox.click();
+          checkbox.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
+        }
+        
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const addButton = buttons.find(b => b.innerText.trim() === 'Add');
+        if (addButton) {
+          addButton.click();
+          return { success: true, clickedAdd: true };
+        }
+        return { success: false, error: 'Add button not found' };
+      }, [params.name, params.username, params.password, params.extraInfo], tabId);
     case 'click':
       return await runInTab(clickElementInTab, [params.selector], tabId);
     case 'type':
@@ -227,9 +399,43 @@ async function handleCommand(action, params = {}) {
     case 'wait':
       return await runInTab(waitInTab, [params.selector, params.timeout], tabId);
     case 'execute':
-      return await runInTab(executeRawJs, [params.code], tabId);
+      return await runInTab(executeRawJs, [params.code], tabId, params.world || 'ISOLATED');
+    case 'check_extension_ai':
+      return {
+        hasChrome: typeof chrome !== 'undefined',
+        hasAiOriginTrial: typeof chrome !== 'undefined' && typeof chrome.aiOriginTrial !== 'undefined',
+        aiOriginTrialProps: typeof chrome !== 'undefined' && chrome.aiOriginTrial ? Object.keys(chrome.aiOriginTrial) : null,
+        hasAi: typeof ai !== 'undefined',
+        hasWindowAi: typeof window !== 'undefined' && typeof window.ai !== 'undefined'
+      };
     case 'gmail_search':
       return await runInTab(gmailSearchInTab, [params.query], tabId);
+
+    case 'reload_extension':
+      chrome.runtime.reload();
+      return { success: true };
+
+    case 'promote_to_production_action':
+      return await runInTab(findAndClickProductionInTab, [], tabId);
+
+    case 'dump_dropdown_html':
+      return await runInTab(() => {
+        const results = [];
+        const all = Array.from(document.querySelectorAll('*'));
+        for (let el of all) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0 && rect.left > 1000 && rect.top > 400 && rect.top < 700) {
+            results.push({
+              tag: el.tagName,
+              id: el.id,
+              class: el.className,
+              text: el.innerText ? el.innerText.trim().slice(0, 50) : '',
+              outer: el.outerHTML.slice(0, 150)
+            });
+          }
+        }
+        return results;
+      }, [], tabId);
 
     default:
       throw new Error(`Unknown action: ${action}`);
@@ -239,39 +445,70 @@ async function handleCommand(action, params = {}) {
 // --- Browser-Level Commands ---
 
 async function listTabs() {
-  const tabs = await chrome.tabs.query({});
-  return tabs.map(t => ({
-    id: t.id,
-    title: t.title,
-    url: t.url,
-    active: t.active,
-    favIconUrl: t.favIconUrl
-  }));
+  try {
+    const tabs = await chrome.tabs.query({});
+    if (!tabs || !Array.isArray(tabs)) return [];
+    return tabs.map(t => ({
+      id: t.id,
+      title: t.title || 'Untitled',
+      url: t.url || '',
+      active: !!t.active,
+      favIconUrl: t.favIconUrl || ''
+    }));
+  } catch (err) {
+    extLog('warn', 'listTabs query warning: ' + err.message);
+    return [];
+  }
 }
 
 async function newTab(url = 'https://www.google.com', active = true) {
-  const tab = await chrome.tabs.create({ url, active });
-  targetTabId = tab.id;
-  return { id: tab.id, title: tab.title, url: tab.url };
+  try {
+    const tab = await chrome.tabs.create({ url, active });
+    targetTabId = tab.id;
+    return { id: tab.id, title: tab.title, url: tab.url };
+  } catch (err) {
+    extLog('warn', 'newTab tabs.create caught: ' + (err ? (err.message || String(err)) : 'unknown'));
+    try {
+      const win = await chrome.windows.create({ url, focused: active });
+      const tab = (win.tabs && win.tabs[0]) || null;
+      if (tab) targetTabId = tab.id;
+      return { id: tab ? tab.id : win.id, title: tab ? tab.title : '', url };
+    } catch (winErr) {
+      extLog('error', 'windows.create failed: ' + (winErr ? (winErr.message || String(winErr)) : 'unknown'));
+      throw winErr;
+    }
+  }
 }
 
 async function selectTab(tabId) {
-  const parsedId = parseInt(tabId);
-  const tab = await chrome.tabs.update(parsedId, { active: true });
-  targetTabId = parsedId;
-  if (tab.windowId) {
-    await chrome.windows.update(tab.windowId, { focused: true });
+  try {
+    const parsedId = parseInt(tabId);
+    if (isNaN(parsedId)) throw new Error(`Invalid tab ID: ${tabId}`);
+    const tab = await chrome.tabs.update(parsedId, { active: true });
+    targetTabId = parsedId;
+    if (tab && tab.windowId) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch (wErr) { /* ignore window focus errors */ }
+    }
+    return { id: tab ? tab.id : parsedId, title: tab ? tab.title : '', url: tab ? tab.url : '' };
+  } catch (err) {
+    throw new Error(`Failed to select tab ${tabId}: ${err.message}`);
   }
-  return { id: tab.id, title: tab.title, url: tab.url };
 }
 
 async function closeTab(tabId) {
-  const parsedId = parseInt(tabId);
-  await chrome.tabs.remove(parsedId);
-  if (targetTabId === parsedId) {
-    targetTabId = null;
+  try {
+    const parsedId = parseInt(tabId);
+    if (isNaN(parsedId)) throw new Error(`Invalid tab ID: ${tabId}`);
+    await chrome.tabs.remove(parsedId);
+    if (targetTabId === parsedId) {
+      targetTabId = null;
+    }
+    return { success: true };
+  } catch (err) {
+    throw new Error(`Failed to close tab ${tabId}: ${err.message}`);
   }
-  return { success: true };
 }
 
 async function captureScreenshot() {
@@ -356,7 +593,7 @@ function isScriptableUrl(url) {
       return false;
     }
     const host = parsed.hostname.toLowerCase();
-    // Block Chrome Web Store, Edge Add-ons, and local browser pages
+    // Block Chrome Web Store entirely (Chrome security model blocks executeScript across all store URLs), Edge Add-ons, and local browser pages
     if (host === 'chromewebstore.google.com' || 
         (host === 'chrome.google.com' && parsed.pathname.startsWith('/webstore')) ||
         (host === 'edge.microsoft.com' && parsed.pathname.startsWith('/addons'))) {
@@ -419,7 +656,7 @@ async function getTargetTab() {
   return await getActiveWebTab();
 }
 
-async function runInTab(func, args = [], tabId = null) {
+async function runInTab(func, args = [], tabId = null, world = 'ISOLATED') {
   let tab = null;
   if (tabId !== null && tabId !== undefined) {
     const parsedId = parseInt(tabId);
@@ -444,12 +681,19 @@ async function runInTab(func, args = [], tabId = null) {
   // Guard: Wait for tab to finish loading if it's still in 'loading' state
   if (tab.status === 'loading') {
     await new Promise((resolve) => {
-      const timeout = setTimeout(resolve, 8000); // Safety timeout
+      let resolved = false;
+      function cleanup() {
+        if (!resolved) {
+          resolved = true;
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          clearTimeout(timeout);
+          resolve();
+        }
+      }
+      const timeout = setTimeout(cleanup, 8000); // Safety timeout
       function onUpdated(tId, changeInfo) {
         if (tId === tab.id && changeInfo.status === 'complete') {
-          clearTimeout(timeout);
-          chrome.tabs.onUpdated.removeListener(onUpdated);
-          resolve();
+          cleanup();
         }
       }
       chrome.tabs.onUpdated.addListener(onUpdated);
@@ -466,7 +710,8 @@ async function runInTab(func, args = [], tabId = null) {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: func,
-      args: args
+      args: args,
+      world: world
     });
 
     if (!results || results.length === 0) {
@@ -490,7 +735,13 @@ async function runInTab(func, args = [], tabId = null) {
 // Note: These run in the context of the target web page, so they cannot access extension APIs, only standard DOM.
 
 function executeRawJs(code) {
-  return eval(code);
+  try {
+    const val = eval(code);
+    if (val === undefined) return JSON.stringify({ result: 'undefined' });
+    return typeof val === 'string' ? val : JSON.stringify(val);
+  } catch (e) {
+    return JSON.stringify({ error: e.message });
+  }
 }
 
 function getContentInTab() {
@@ -568,13 +819,13 @@ function getContentInTab() {
 
     let markdown = '';
     function traverse(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
+      if (node.nodeType === 3) {
         const text = cleanText(node.textContent);
         if (text) markdown += text + ' ';
         return;
       }
 
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.nodeType !== 1) return;
 
       const tagName = node.tagName.toLowerCase();
       const style = window.getComputedStyle(node);
@@ -647,7 +898,7 @@ function getContentInTab() {
       title,
       url,
       markdown,
-      interactive_elements: interactiveElements.slice(0, 100),
+      interactive_elements: interactiveElements,
       identity_elements: identityElements
     };
   } catch (err) {
@@ -665,7 +916,7 @@ function clickElementInTab(selector) {
     let el = null;
 
     if (selector.startsWith('//') || selector.startsWith('((')) {
-      const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+      const result = document.evaluate(selector, document, null, 9, null);
       el = result.singleNodeValue;
     } else {
       try {
@@ -742,10 +993,10 @@ function clickElementInTab(selector) {
       el.setAttribute('style', originalStyle);
     }, 1000);
 
-    const mouseOverEvent = new MouseEvent('mouseover', { bubbles: true, cancelable: true });
-    const mouseDownEvent = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
-    const mouseUpEvent = new MouseEvent('mouseup', { bubbles: true, cancelable: true });
-    const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
+    const mouseOverEvent = new (globalThis.MouseEvent || globalThis.Event)('mouseover', { bubbles: true, cancelable: true });
+    const mouseDownEvent = new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true });
+    const mouseUpEvent = new (globalThis.MouseEvent || globalThis.Event)('mouseup', { bubbles: true, cancelable: true });
+    const clickEvent = new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true, cancelable: true });
 
     el.dispatchEvent(mouseOverEvent);
     el.dispatchEvent(mouseDownEvent);
@@ -762,9 +1013,14 @@ function clickElementInTab(selector) {
 function typeTextInTab(selector, text) {
   try {
     let el = null;
-    try {
-      el = document.querySelector(selector);
-    } catch (e) {}
+    if (selector.startsWith('//') || selector.startsWith('((')) {
+      const result = document.evaluate(selector, document, null, 9, null);
+      el = result.singleNodeValue;
+    } else {
+      try {
+        el = document.querySelector(selector);
+      } catch (e) {}
+    }
 
     if (!el) {
       const inputs = document.querySelectorAll('input, textarea');
@@ -798,22 +1054,30 @@ function typeTextInTab(selector, text) {
       const char = text[i];
       currentVal += char;
 
-      const keydown = new KeyboardEvent('keydown', { key: char, charCode: char.charCodeAt(0), bubbles: true });
-      const keypress = new KeyboardEvent('keypress', { key: char, charCode: char.charCodeAt(0), bubbles: true });
+      const keydown = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', { key: char, charCode: char.charCodeAt(0), bubbles: true });
+      const keypress = new (globalThis.KeyboardEvent || globalThis.Event)('keypress', { key: char, charCode: char.charCodeAt(0), bubbles: true });
 
       el.dispatchEvent(keydown);
       el.dispatchEvent(keypress);
 
-      el.value = currentVal;
+      const proto = el.tagName.toLowerCase() === 'textarea' 
+        ? (globalThis.HTMLTextAreaElement ? globalThis.HTMLTextAreaElement.prototype : null) 
+        : (globalThis.HTMLInputElement ? globalThis.HTMLInputElement.prototype : null);
+      const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(el, currentVal);
+      } else {
+        el.value = currentVal;
+      }
 
-      const inputEvent = new Event('input', { bubbles: true });
+      const inputEvent = new (globalThis.Event || Object)('input', { bubbles: true });
       el.dispatchEvent(inputEvent);
 
-      const keyup = new KeyboardEvent('keyup', { key: char, charCode: char.charCodeAt(0), bubbles: true });
+      const keyup = new (globalThis.KeyboardEvent || globalThis.Event)('keyup', { key: char, charCode: char.charCodeAt(0), bubbles: true });
       el.dispatchEvent(keyup);
     }
 
-    const changeEvent = new Event('change', { bubbles: true });
+    const changeEvent = new (globalThis.Event || Object)('change', { bubbles: true });
     el.dispatchEvent(changeEvent);
 
     setTimeout(() => {
@@ -852,7 +1116,12 @@ function waitInTab(selector, timeout = 5000) {
 
     const start = Date.now();
     const interval = setInterval(() => {
-      const el = document.querySelector(selector);
+      let el = null;
+      try {
+        el = document.querySelector(selector);
+      } catch (e) {
+        // Invalid selector syntax
+      }
       if (el) {
         clearInterval(interval);
         resolve({ success: true, found: selector, elapsed: Date.now() - start });
@@ -872,13 +1141,13 @@ function gmailSearchInTab(query) {
     q.focus();
     q.value = query;
 
-    q.dispatchEvent(new Event('input', { bubbles: true }));
-    q.dispatchEvent(new Event('change', { bubbles: true }));
+    q.dispatchEvent(new (globalThis.Event || Object)('input', { bubbles: true }));
+    q.dispatchEvent(new (globalThis.Event || Object)('change', { bubbles: true }));
 
     const keyOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true };
-    q.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
-    q.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
-    q.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+    q.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keydown', keyOpts));
+    q.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keypress', keyOpts));
+    q.dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keyup', keyOpts));
 
     const form = q.closest('form');
     if (form) {
@@ -893,13 +1162,116 @@ function gmailSearchInTab(query) {
   }
 }
 
-// Listen for message from popup to force reconnect
+async function findAndClickProductionInTab() {
+  try {
+    // 1. Click Promote release button
+    let promoteBtn = null;
+    const buttons = Array.from(document.querySelectorAll('button'));
+    for (let btn of buttons) {
+      if (btn.innerText && btn.innerText.includes('Promote release')) {
+        promoteBtn = btn;
+        break;
+      }
+    }
+    if (!promoteBtn) {
+      return { success: false, error: 'Promote release button not found' };
+    }
+    
+    promoteBtn.scrollIntoView({ block: 'center' });
+    promoteBtn.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseover', { bubbles: true }));
+    promoteBtn.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true }));
+    promoteBtn.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseup', { bubbles: true }));
+    promoteBtn.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true }));
+    
+    // 2. Wait 1 second for the dropdown menu to render
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // 3. Find the Production dropdown option
+    // It has text "Production" and is on the right side of the screen (x > 500)
+    let targetOption = null;
+    const all = Array.from(document.querySelectorAll('*'));
+    for (let el of all) {
+      if (el.innerText && el.innerText.trim().startsWith('Production')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && rect.left > 500) {
+          // Leaf node matching Production
+          let hasChild = false;
+          for (let child of el.children) {
+            if (child.innerText && child.innerText.trim().startsWith('Production')) {
+              hasChild = true;
+              break;
+            }
+          }
+          if (!hasChild) {
+            targetOption = el;
+            break;
+          }
+        }
+      }
+    }
+    
+    if (!targetOption) {
+      // Fallback
+      for (let el of all) {
+        if (el.innerText && el.innerText.includes('Production')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0 && rect.left > 500) {
+            targetOption = el;
+            break;
+          }
+        }
+      }
+    }
+    
+    if (!targetOption) {
+      return { success: false, error: 'Production dropdown option not found' };
+    }
+    
+    // Click the target option
+    targetOption.scrollIntoView({ block: 'center' });
+    targetOption.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseover', { bubbles: true }));
+    targetOption.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true }));
+    targetOption.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mouseup', { bubbles: true }));
+    targetOption.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('click', { bubbles: true }));
+    
+    return {
+      success: true,
+      clickedTag: targetOption.tagName,
+      clickedClass: targetOption.className,
+      outerHTML: targetOption.outerHTML.slice(0, 300)
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// Listen for message from popup/content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message) return;
+  if (message.action === 'ping') {
+    // Content script ping wakes up SW and reconnects ONLY if currently disconnected.
+    // NEVER disconnect an active, healthy WebSocket connection.
+    if (shouldConnect()) {
+      extLog('info', 'Ping received while disconnected. Triggering connect...');
+      connect();
+    }
+    if (sendResponse) sendResponse({ success: true, connected: !shouldConnect() });
+    return true;
+  }
   if (message.action === 'reconnect') {
-    console.log('BrowserAgentBridge: Reconnect triggered from popup.');
-    reconnectDelay = 5000;
+    extLog('info', 'Explicit reconnect requested from popup');
+    reconnectDelay = 2000;
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+      ws = null;
+    }
     connect();
-    sendResponse({ success: true });
+    if (sendResponse) sendResponse({ success: true });
+    return true;
   }
 });
+
+// Immediate top-level connection trigger when Service Worker script is evaluated
+extLog('info', 'background.js top-level evaluation complete. Triggering connect()...');
+connect();

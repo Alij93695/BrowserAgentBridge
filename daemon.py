@@ -4,7 +4,15 @@ import json
 import logging
 import uuid
 import os
+import sys
 from typing import Dict, Set
+
+# Redirect stdout/stderr if None (for pythonw.exe windowless mode compatibility)
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,8 +21,9 @@ from pydantic import BaseModel
 # Configure logging
 log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-# File handler for webbridge.log
-file_handler = logging.FileHandler("webbridge.log", encoding="utf-8")
+# File handler for webbridge.log next to daemon.py
+log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webbridge.log")
+file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
 file_handler.setFormatter(log_formatter)
 file_handler.setLevel(logging.INFO)
 
@@ -44,10 +53,13 @@ class ExtensionManager:
         self.last_status = "connected"
         logger.info("Extension WebSocket registered.")
 
-    def remove_websocket(self):
-        self.active_websocket = None
-        self.last_status = "disconnected"
-        logger.info("Extension WebSocket unregistered.")
+    def remove_websocket(self, websocket: WebSocket):
+        if self.active_websocket == websocket:
+            self.active_websocket = None
+            self.last_status = "disconnected"
+            logger.info("Extension WebSocket unregistered.")
+        else:
+            logger.info("Old/inactive WebSocket unregistered (ignored).")
 
     def is_connected(self) -> bool:
         return self.active_websocket is not None
@@ -97,20 +109,22 @@ logs_history = []
 
 def log_event(message: str):
     logger.info(message)
-    log_item = {"timestamp": os.popen("date /t").read().strip() + " " + os.popen("time /t").read().strip(), "message": message}
-    # Wait, simple datetime formatting is cleaner and cross-platform
     from datetime import datetime
-    time_str = datetime.now().strftime("%H:%M:%S")
+    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_item = {"timestamp": time_str, "message": message}
     logs_history.append(log_item)
     if len(logs_history) > 100:
         logs_history.pop(0)
     
-    # Broadcast to all dashboards
-    asyncio.create_task(broadcast_to_dashboards({
-        "type": "log",
-        "log": log_item
-    }))
+    # Broadcast to all dashboards if event loop is active
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(broadcast_to_dashboards({
+            "type": "log",
+            "log": log_item
+        }))
+    except RuntimeError:
+        pass
 
 async def broadcast_to_dashboards(data: dict):
     if not dashboard_websockets:
@@ -130,6 +144,16 @@ class CommandRequest(BaseModel):
     action: str
     params: dict = {}
     timeout: float = 20.0
+
+class LogRequest(BaseModel):
+    level: str = "info"
+    message: str
+
+@app.post("/api/log")
+async def post_log(log_req: LogRequest):
+    msg = f"[EXTENSION-{log_req.level.upper()}] {log_req.message}"
+    log_event(msg)
+    return {"status": "ok"}
 
 @app.get("/api/status")
 async def get_status():
@@ -226,9 +250,6 @@ async def websocket_endpoint(websocket: WebSocket):
         "type": "connection",
         "connected": True
     }))
-    
-    # Trigger initial telemetry load
-    schedule_telemetry_refresh()
 
     try:
         while True:
@@ -251,7 +272,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 log_event(f"Extension status update: {data.get('status')}")
             
     except WebSocketDisconnect:
-        extension_manager.remove_websocket()
+        extension_manager.remove_websocket(websocket)
         log_event("Chrome extension disconnected.")
         # Broadcast disconnection to dashboards
         asyncio.create_task(broadcast_to_dashboards({
@@ -298,11 +319,12 @@ async def dashboard_websocket_endpoint(websocket: WebSocket):
         logger.info("Dashboard disconnected from telemetry.")
 
 
-# Serve dashboard files. Make sure the directory exists first.
-os.makedirs("dashboard", exist_ok=True)
+# Serve dashboard files relative to this script directory
+dashboard_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
+os.makedirs(dashboard_dir, exist_ok=True)
 
 try:
-    app.mount("/", StaticFiles(directory="dashboard", html=True), name="dashboard")
+    app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
 except Exception as e:
     logger.error(f"Failed to mount static files at root: {e}")
 
